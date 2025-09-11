@@ -26,16 +26,15 @@ DD_LIMIT_PCT   = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop
 
 # Eingangs-Payload: wo liegt der Text? (bei rohem Discord-JSON meist "content")
 TEXT_PATH      = os.getenv("TEXT_PATH", "content")
-DEFAULT_NOTION = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT pro Trade
+DEFAULT_NOTION = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
 
 # ========= App / State =========
 app = FastAPI()
 _httpx_client: Optional[httpx.AsyncClient] = None
 
 STATE: Dict[str, Any] = {
-    "last_trade_ts": 0.0,             # Cooldown-Start (erst bei Entry-Fill)
+    "last_trade_ts": 0.0,             # wird NUR bei Entry-FILL gesetzt
     "trading_paused_until": None,     # iso-zeit
-    "day_key": None,                  # "YYYY-MM-DD"
     "day_start_equity": None,         # USDT
     "day_realized_pnl": 0.0,          # (vereinfachte) Summe
     "open_watch": {}                  # symbol -> meta (ids, preise, flags)
@@ -57,7 +56,7 @@ def round_tick(base: str, v: float) -> float:
 @app.on_event("startup")
 async def _startup():
     global _httpx_client
-    _httpx_client = httpx.AsyncClient(timeout=12.0)
+    _httpx_client = httpx.AsyncClient(timeout=15.0)
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -68,7 +67,6 @@ async def _shutdown():
 
 # ========= Bybit v5 Client (Header-Sign, SignType=2) =========
 def _qs(params: Dict[str, Any]) -> str:
-    """Alphabetisch sortierter k=v&k2=v2 Querystring NUR aus endpoint-Params (für GET)."""
     items = [(k, str(v)) for k, v in params.items() if v is not None and v != ""]
     items.sort(key=lambda kv: kv[0])
     return "&".join(f"{k}={v}" for k, v in items)
@@ -113,10 +111,14 @@ async def bybit(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any
         url = f"{BYBIT_BASE}{path}"
         r = await _httpx_client.post(url, headers=headers, content=body.encode("utf-8"))
 
+    # Toleranz: 110043 (leverage not modified) als Erfolg behandeln
     try:
         data = r.json()
     except Exception:
         raise HTTPException(502, f"Bybit non-JSON response ({r.status_code}): {r.text[:200]}")
+
+    if data.get("retCode") == 110043:
+        return {}  # treat as ok
 
     if r.status_code != 200 or data.get("retCode") != 0:
         raise HTTPException(502, f"Bybit error {data.get('retCode')}: {data.get('retMsg')}, {data}")
@@ -212,34 +214,38 @@ def leverage_from_sl(entry: float, sl: float, side: str) -> int:
     return lev
 
 async def set_leverage(symbol: str, lev: int):
+    # ruft bybit(), das 110043 intern toleriert
     await bybit("/v5/position/set-leverage","POST",{
         "category":"linear","symbol":symbol,
         "buyLeverage": str(lev),"sellLeverage": str(lev)
     })
 
-async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: float, sl: float,
-                       notional_usdt: float):
+async def place_entry_only(symbol: str, side: str, entry: float, notional_usdt: float):
+    """Nur Entry-Limit platzieren. TP/SL werden NACH Fill erzeugt."""
     qty = max(0.001, round(notional_usdt/entry, 6))
     BY = "Buy" if side=="long" else "Sell"
-    OP = "Sell" if BY=="Buy" else "Buy"
-
     uid = hex(int(time.time()*1000))[2:]
     link_entry = f"ent_{symbol}_{uid}"
-    link_tp1   = f"tp1_{symbol}_{uid}"
-    link_tp2   = f"tp2_{symbol}_{uid}"
-    link_sl    = f"sl_{symbol}_{uid}"
 
-    # Entry Limit
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":BY,
         "orderType":"Limit","price":str(entry),"qty":str(qty),
         "timeInForce":"GTC","reduceOnly":"false","orderLinkId":link_entry
     })
+    return link_entry, qty
 
-    # Partials 20/80 (reduceOnly)
-    q1 = max(0.001, round(qty * (TP1_POS_PCT/100.0), 6))
-    q2 = max(0.001, round(qty - q1, 6))
+async def place_tp_sl_after_fill(symbol: str, side: str, size: float, tp1: float, tp2: float, sl: float):
+    """Nach Entry-Fill: TP1/TP2 reduceOnly + StopLoss anlegen."""
+    OP = "Sell" if side=="long" else "Buy"
+    uid = hex(int(time.time()*1000))[2:]
+    link_tp1 = f"tp1_{symbol}_{uid}"
+    link_tp2 = f"tp2_{symbol}_{uid}"
+    link_sl  = f"sl_{symbol}_{uid}"
 
+    q1 = max(0.001, round(size * (TP1_POS_PCT/100.0), 6))
+    q2 = max(0.001, round(size - q1, 6))
+
+    # TP1 / TP2
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
         "orderType":"Limit","price":str(tp1),"qty":str(q1),
@@ -251,8 +257,8 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
         "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2
     })
 
-    # SL Stop-Market (reduceOnly)
-    trigDir = 2 if BY=="Buy" else 1
+    # StopLoss (Stop-Market)
+    trigDir = 2 if OP=="Sell" else 1  # falls benötigt, wird hier aber nicht strikt geprüft
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
         "orderType":"Market","reduceOnly":"true",
@@ -260,17 +266,7 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
         "stopOrderType":"StopLoss","timeInForce":"GTC",
         "orderLinkId":link_sl
     })
-
-    STATE["open_watch"][symbol] = {
-        "tp1_id": link_tp1, "tp2_id": link_tp2, "sl_id": link_sl,
-        "entry_id": link_entry, "side": side,
-        "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2,
-        "qty": qty,
-        "created_ts": now_ts(), "expiry_min": ENTRY_EXP_MIN,
-        "did_be": False, "did_tp2_move": False,
-        "marked_filled": False
-    }
-    return {"entry":link_entry,"tp1":link_tp1,"tp2":link_tp2,"sl":link_sl,"qty":qty}
+    return link_tp1, link_tp2, link_sl
 
 async def order_status_by_link(symbol: str, link_id: str) -> Optional[str]:
     res = await bybit("/v5/order/realtime","GET",{
@@ -279,6 +275,14 @@ async def order_status_by_link(symbol: str, link_id: str) -> Optional[str]:
     lst = res.get("list",[])
     if not lst: return None
     return lst[0].get("orderStatus")  # New / PartiallyFilled / Filled / Cancelled / Rejected
+
+async def positions_size_symbol(symbol: str) -> float:
+    pos = await positions(symbol)
+    if not pos: return 0.0
+    try:
+        return float(pos[0].get("size") or 0)
+    except Exception:
+        return 0.0
 
 async def set_stop_to_BE(symbol: str, side: str):
     pos = await positions(symbol)
@@ -314,60 +318,62 @@ async def monitor_loop():
             if datetime.now(timezone.utc) >= datetime.fromisoformat(STATE["trading_paused_until"]):
                 STATE["trading_paused_until"] = None
 
-        # Entries expiren; BE/TP2-Moves; Cleanup
         to_del = []
         for symbol, meta in list(STATE["open_watch"].items()):
-            # Entry Status
-            st_entry = await order_status_by_link(symbol, meta["entry_id"])
+            # Entry-Expiry, solange Entry nicht filled
+            if not meta.get("filled"):
+                if now_ts() - meta["created_ts"] > meta.get("expiry_min", 60)*60:
+                    st = await order_status_by_link(symbol, meta["entry_id"])
+                    if st in ("New","PartiallyFilled"):
+                        await cancel_order(symbol, meta["entry_id"])
+                        to_del.append(symbol)
+                        continue
 
-            # a) Cooldown erst bei tatsächlichem Fill
-            if st_entry == "Filled" and not meta.get("marked_filled"):
-                STATE["last_trade_ts"] = now_ts()
-                meta["marked_filled"] = True
+                # Check ob Entry filled
+                st_entry = await order_status_by_link(symbol, meta["entry_id"])
+                if st_entry == "Filled":
+                    # Positiongröße holen
+                    size = await positions_size_symbol(symbol)
+                    if size <= 0:
+                        # kurz warten & nochmal versuchen
+                        await asyncio.sleep(2)
+                        size = await positions_size_symbol(symbol)
 
-            # b) Entry manuell gecancelt? -> bis Expiry neu setzen
-            still_in_window = (now_ts() - meta["created_ts"] < meta.get("expiry_min", 60) * 60)
-            if st_entry == "Cancelled" and still_in_window and not meta.get("marked_filled"):
-                new_id = f"ent_{symbol}_{int(now_ts()*1000)}"
-                BY = "Buy" if meta["side"] == "long" else "Sell"
-                await bybit("/v5/order/create","POST",{
-                    "category":"linear","symbol":symbol,"side":BY,
-                    "orderType":"Limit","price":str(meta["entry_px"]), "qty":str(meta["qty"]),
-                    "timeInForce":"GTC","reduceOnly":"false","orderLinkId":new_id
-                })
-                meta["entry_id"] = new_id
-                # nächster Loop prüft erneut
-                continue
+                    # TP/SL jetzt anlegen
+                    tp1_id, tp2_id, sl_id = await place_tp_sl_after_fill(
+                        symbol=symbol,
+                        side=meta["side"],
+                        size=size,
+                        tp1=meta["tp1_px"],
+                        tp2=meta["tp2_px"],
+                        sl=meta["sl_px"],
+                    )
+                    meta["tp1_id"] = tp1_id
+                    meta["tp2_id"] = tp2_id
+                    meta["sl_id"]  = sl_id
+                    meta["filled"] = True
+                    STATE["last_trade_ts"] = now_ts()  # Cooldown JETZT erst starten
+                    continue
 
-            # c) Entry Expiry: ungefüllte Entry nach Ablauf löschen
-            if not meta.get("marked_filled") and not still_in_window:
-                if st_entry in ("New","PartiallyFilled"):
-                    await cancel_order(symbol, meta["entry_id"])
-                to_del.append(symbol)
-                continue
+            # Nach Fill: TP/BE-Logik
+            if meta.get("filled"):
+                # TP1 filled -> SL -> BE
+                if not meta.get("did_be") and meta.get("tp1_id"):
+                    st_tp1 = await order_status_by_link(symbol, meta["tp1_id"])
+                    if st_tp1 == "Filled":
+                        await set_stop_to_BE(symbol, meta["side"])
+                        meta["did_be"] = True
 
-            # --- TP/SL Nachlogik nur nach Fill sinnvoll ---
-            # TP1 -> SL auf BE, alten SL löschen
-            st_tp1 = await order_status_by_link(symbol, meta["tp1_id"])
-            if st_tp1 == "Filled" and not meta.get("did_be"):
-                await set_stop_to_BE(symbol, meta["side"])
-                await cancel_order(symbol, meta["sl_id"])
-                meta["did_be"] = True
+                # TP2 filled -> SL -> TP1 (Profit lock)
+                if not meta.get("did_tp2_move") and meta.get("tp2_id"):
+                    st_tp2 = await order_status_by_link(symbol, meta["tp2_id"])
+                    if st_tp2 == "Filled":
+                        await move_stop_to(symbol, meta["tp1_px"])
+                        meta["did_tp2_move"] = True
 
-            # TP2 -> Stop auf TP1 (Profit lock)
-            st_tp2 = await order_status_by_link(symbol, meta["tp2_id"])
-            if st_tp2 == "Filled" and not meta.get("did_tp2_move"):
-                await move_stop_to(symbol, meta["tp1_px"])
-                meta["did_tp2_move"] = True
-
-            # Cleanup, wenn Position geschlossen
-            pos = await positions(symbol)
-            if pos:
-                sz = float(pos[0].get("size") or 0)
-                if sz == 0 and meta.get("marked_filled"):
-                    to_del.append(symbol)
-            else:
-                if meta.get("marked_filled"):
+                # Cleanup wenn Position geschlossen
+                size = await positions_size_symbol(symbol)
+                if size == 0.0:
                     to_del.append(symbol)
 
         for s in to_del:
@@ -386,6 +392,7 @@ def trading_paused() -> bool:
 
 async def check_daily_dd_and_pause(pnl_delta: float = 0.0):
     STATE["day_realized_pnl"] += pnl_delta
+    # optional: Equity & DD prüfen (vereinfacht)
     eq = await get_wallet_equity()
     if eq and STATE.get("day_start_equity") is None:
         STATE["day_start_equity"] = eq
@@ -430,7 +437,7 @@ async def webhook(request: Request):
     if not text:
         raise HTTPException(400, "No signal text found (neither 'text' nor TEXT_PATH)")
 
-    # Positionsgröße (USDT)
+    # Positionsgröße (Margin, ohne Hebel)
     notional = float(body.get("notional") or DEFAULT_NOTION)
 
     # TF filtern & erstes valides Setup
@@ -438,14 +445,16 @@ async def webhook(request: Request):
     if not sigs:
         raise HTTPException(422, f"No valid signal for TFs {sorted(ALLOWED_TFS)} found")
 
+    # Cooldown nur blocken, wenn bereits letzter FILL jung ist
     if in_cooldown():
-        raise HTTPException(429, f"In cooldown ({COOLDOWN_MIN} min)")
+        raise HTTPException(429, f"In cooldown ({COOLDOWN_MIN} min since last fill)")
 
     sig = sigs[0]
     base, quote, side = sig["base"], sig["quote"], sig["side"]
     entry, tp1, tp2, sl = sig["entry"], sig["tp1"], sig["tp2"], sig["sl"]
-    symbol = f"{base}{quote}"  # Bybit Perp: z.B. SOLUSDT
+    symbol = f"{base}{quote}"  # Bybit Perp: e.g. SOLUSDT
 
+    # Hebel
     lev = leverage_from_sl(entry, sl, side)
     await set_leverage(symbol, lev)
 
@@ -453,15 +462,24 @@ async def webhook(request: Request):
     if paused:
         raise HTTPException(423, "Trading paused by daily drawdown")
 
-    res = await place_orders(symbol, side, entry, tp1, tp2, sl, notional_usdt=notional)
+    # Nur Entry platzieren; TP/SL nach Fill
+    entry_id, qty = await place_entry_only(symbol, side, entry, notional_usdt=notional)
+
+    # Watch-Objekt anlegen
+    STATE["open_watch"][symbol] = {
+        "entry_id": entry_id, "side": side,
+        "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2, "sl_px": sl,
+        "created_ts": now_ts(), "expiry_min": ENTRY_EXP_MIN,
+        "filled": False, "did_be": False, "did_tp2_move": False
+    }
 
     return {
         "ok": True,
         "symbol": symbol, "side": side,
         "entry": entry, "tp1": tp1, "tp2": tp2, "sl": sl,
         "leverage": lev,
-        "order_ids": res,
-        "cooldown_min": COOLDOWN_MIN
+        "entry_order_id": entry_id,
+        "note": "TP/SL werden nach Entry-Fill automatisch angelegt."
     }
 
 @app.get("/health")
