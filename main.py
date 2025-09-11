@@ -9,53 +9,47 @@ from fastapi import FastAPI, Request, HTTPException
 BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
 BYBIT_KEY        = os.getenv("BYBIT_KEY", "")
 BYBIT_SECRET     = os.getenv("BYBIT_SECRET", "")
-SETTLE_COIN      = os.getenv("SETTLE_COIN", "USDT")  # <- NEU: für /v5/position/list ohne symbol
+SETTLE_COIN      = os.getenv("SETTLE_COIN", "USDT")
 
-# Timeframe-Filter, z.B. "H1" oder "H1,H4,M15"
+# Timeframe-Filter
 ALLOWED_TFS      = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
 
 # Positionslogik
-TP1_POS_PCT      = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
+TP1_POS_PCT      = float(os.getenv("TP1_POS_PCT", "20"))
 TP2_POS_PCT      = float(os.getenv("TP2_POS_PCT", "80"))
 MAX_LEV_CAP      = int(os.getenv("MAX_LEV_CAP", "75"))
-SAFETY_PCT       = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
+SAFETY_PCT       = float(os.getenv("SAFETY_PCT", "80"))
 
 # Guards
-COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min., ab Fill)
-ENTRY_EXP_MIN    = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
-DD_LIMIT_PCT     = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
+COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "45"))
+ENTRY_EXP_MIN    = int(os.getenv("ENTRY_EXP_MIN", "60"))
+DD_LIMIT_PCT     = float(os.getenv("DD_LIMIT_PCT", "2.8"))
 
-# Positions-Limits (nur wirklich gefüllte Positionen werden gezählt)
+# Positions-Limits
 MAX_OPEN_LONGS   = int(os.getenv("MAX_OPEN_LONGS", "999"))
 MAX_OPEN_SHORTS  = int(os.getenv("MAX_OPEN_SHORTS", "999"))
 
-# Eingangs-Payload: wo liegt der Text? (bei rohem Discord-JSON meist "content")
+# Eingangs-Payload
 TEXT_PATH        = os.getenv("TEXT_PATH", "content")
-DEFAULT_NOTION   = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
+DEFAULT_NOTION   = float(os.getenv("DEFAULT_NOTIONAL", "50"))
 
 # ========= App / State =========
 app = FastAPI()
 _httpx_client: Optional[httpx.AsyncClient] = None
 
 STATE: Dict[str, Any] = {
-    "last_trade_ts": 0.0,             # wird NUR bei Entry-FILL gesetzt
-    "trading_paused_until": None,     # iso-zeit
-    "day_start_equity": None,         # USDT
-    "day_realized_pnl": 0.0,          # (vereinfachte) Summe
-    "open_watch": {}                  # symbol -> meta (ids, preise, flags)
+    "last_trade_ts": 0.0,
+    "trading_paused_until": None,
+    "day_start_equity": None,
+    "day_realized_pnl": 0.0,
+    "open_watch": {}
 }
 
-# Tick-Rundung je Coin (bei Bedarf erweitern)
-TICK_DECIMALS = {
-    "SHIB": 8, "DOGE": 5, "XRP": 4, "SOL": 2, "AVAX": 3, "AAVE": 2, "LINK": 3,
-    "BTC": 2, "ETH": 2, "BNB": 2, "LTC": 2, "ADA": 5, "MATIC": 5, "EOS": 4, "BCH": 2, "ATOM": 3, "ALGO": 5
-}
-
+# ========= Tools =========
 def now_ts() -> float: return time.time()
+
 def round_tick(base: str, v: float) -> float:
-    d = TICK_DECIMALS.get(base, 4)
-    p = 10 ** d
-    return round(v * p) / p
+    return round(v, 6)
 
 # ========= FastAPI Lifecycle =========
 @app.on_event("startup")
@@ -70,21 +64,15 @@ async def _shutdown():
         await _httpx_client.aclose()
         _httpx_client = None
 
-# ========= Bybit v5 Client (Header-Sign, SignType=2) =========
+# ========= Bybit v5 Client =========
 def _qs(params: Dict[str, Any]) -> str:
-    items = [(k, str(v)) for k, v in params.items() if v is not None and v != ""]
+    items = [(k, str(v)) for k, v in params.items() if v not in (None, "")]
     items.sort(key=lambda kv: kv[0])
     return "&".join(f"{k}={v}" for k, v in items)
 
 async def bybit(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    v5 Header-Sign:
-      prehash = timestamp + api_key + recv_window + (querystring for GET | raw json for POST)
-      Headers: X-BAPI-API-KEY, X-BAPI-SIGN, X-BAPI-SIGN-TYPE=2, X-BAPI-TIMESTAMP, X-BAPI-RECV-WINDOW
-    """
     if not BYBIT_KEY or not BYBIT_SECRET:
         raise HTTPException(500, "BYBIT_KEY/SECRET not set")
-    global _httpx_client
     if not _httpx_client:
         raise HTTPException(500, "HTTP client not ready")
 
@@ -97,37 +85,49 @@ async def bybit(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any
         "X-BAPI-RECV-WINDOW": recv,
         "Content-Type": "application/json",
     }
-
     method = method.upper()
     if method == "GET":
         q = _qs(params)
         prehash = ts + BYBIT_KEY + recv + q
         sig = hmac.new(BYBIT_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
         headers["X-BAPI-SIGN"] = sig
-        url = f"{BYBIT_BASE}{path}"
-        if q:
-            url += f"?{q}"
+        url = f"{BYBIT_BASE}{path}" + (f"?{q}" if q else "")
         r = await _httpx_client.get(url, headers=headers)
     else:
-        body = json.dumps(params, separators=(',', ':'), ensure_ascii=False, sort_keys=True)
+        body = json.dumps(params, separators=(',', ':'), sort_keys=True)
         prehash = ts + BYBIT_KEY + recv + body
         sig = hmac.new(BYBIT_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
         headers["X-BAPI-SIGN"] = sig
         url = f"{BYBIT_BASE}{path}"
         r = await _httpx_client.post(url, headers=headers, content=body.encode("utf-8"))
 
-    # 110043 (leverage not modified) als Erfolg tolerieren
-    try:
-        data = r.json()
-    except Exception:
-        raise HTTPException(502, f"Bybit non-JSON response ({r.status_code}): {r.text[:200]}")
+    try: data = r.json()
+    except Exception: raise HTTPException(502, f"Bybit non-JSON {r.status_code}: {r.text[:200]}")
 
     if data.get("retCode") == 110043:
         return {}
-
     if r.status_code != 200 or data.get("retCode") != 0:
         raise HTTPException(502, f"Bybit error {data.get('retCode')}: {data.get('retMsg')}, {data}")
     return data.get("result", {}) or {}
+
+# ========= Instruments & Qty =========
+INSTR_CACHE: Dict[str, Dict[str, float]] = {}
+
+async def get_symbol_filters(symbol: str) -> Dict[str, float]:
+    if symbol in INSTR_CACHE: return INSTR_CACHE[symbol]
+    res = await bybit("/v5/market/instruments-info", "GET", {"category": "linear","symbol":symbol})
+    lst = res.get("list", [])
+    if not lst:
+        INSTR_CACHE[symbol] = {"qtyStep": 0.001, "minOrderQty": 0.001}
+        return INSTR_CACHE[symbol]
+    f = lst[0].get("lotSizeFilter", {})
+    qty_step = float(f.get("qtyStep", "0.001"))
+    min_qty  = float(f.get("minOrderQty", "0.001"))
+    INSTR_CACHE[symbol] = {"qtyStep": qty_step, "minOrderQty": min_qty}
+    return INSTR_CACHE[symbol]
+
+def quantize_qty(q: float, step: float) -> float:
+    return max(0.0, (int(q / step)) * step) if step>0 else q
 
 # ========= Wallet / Positions =========
 async def get_wallet_equity() -> Optional[float]:
@@ -137,134 +137,80 @@ async def get_wallet_equity() -> Optional[float]:
             for coin in item.get("coin", []):
                 if coin.get("coin") == "USDT":
                     return float(coin.get("walletBalance"))
-    except Exception:
-        pass
+    except: pass
     return None
 
 async def positions(symbol: Optional[str] = None):
-    """
-    Holt Positionsliste. Falls kein symbol übergeben wird, hängen wir settleCoin an,
-    weil einige Konten ansonsten 10001 (Missing symbol or settleCoin) liefern.
-    """
     params = {"category":"linear"}
-    if symbol:
-        params["symbol"] = symbol
-    else:
-        params["settleCoin"] = SETTLE_COIN  # <- WICHTIG
+    if symbol: params["symbol"] = symbol
+    else: params["settleCoin"] = SETTLE_COIN
     res = await bybit("/v5/position/list", "GET", params)
     return res.get("list", [])
 
 async def positions_size_symbol(symbol: str) -> float:
     pos = await positions(symbol)
     if not pos: return 0.0
-    try:
-        return float(pos[0].get("size") or 0)
-    except Exception:
-        return 0.0
+    return float(pos[0].get("size") or 0)
 
 async def count_open_filled() -> Dict[str, int]:
-    """Zähle gefüllte Positionen (size>0) getrennt nach long/short."""
-    res = await positions()  # liefert dank settleCoin jetzt sicher Ergebnisse
+    res = await positions()
     longs = shorts = 0
     for p in res:
         try:
             sz = float(p.get("size") or 0)
-            if sz <= 0:
-                continue
-            side = (p.get("side") or "").lower()  # "Buy"/"Sell"
-            if side == "buy":
-                longs += 1
-            elif side == "sell":
-                shorts += 1
-        except Exception:
-            pass
+            if sz <= 0: continue
+            side = (p.get("side") or "").lower()
+            if side == "buy": longs += 1
+            elif side == "sell": shorts += 1
+        except: pass
     return {"longs": longs, "shorts": shorts}
 
-async def close_all_positions():
-    pos = await positions()
-    tasks = []
-    for p in pos:
-        sym = p.get("symbol")
-        sz  = float(p.get("size") or 0)
-        side= p.get("side")  # "Buy" / "Sell"
-        if sym and sz > 0:
-            opp = "Sell" if side=="Buy" else "Buy"
-            tasks.append(bybit("/v5/order/create","POST",{
-                "category":"linear","symbol":sym,"side":opp,"orderType":"Market",
-                "reduceOnly":"true","qty":str(sz)
-            }))
-    if tasks: await asyncio.gather(*tasks)
-
-# ========= Parser (mit TF-Filter) =========
+# ========= Parser =========
 def parse_signals(text: str):
-    """
-    Erwartet den kompletten Signaltext (evtl. mehrere Blöcke).
-    Gibt NUR Blöcke zurück, die 'Timeframe: ...' enthalten und in ALLOWED_TFS liegen.
-    Rückgabe: Liste [{base, quote, side, entry, tp1, tp2, sl, tf}]
-    """
     txt = text.replace("\r","")
     blocks = re.split(r"\n\s*\n", txt.strip())
     signals = []
     for b in blocks:
         m_tf = re.search(r"Timeframe:\s*([A-Za-z0-9]+)", b, re.I)
-        if not m_tf:
-            continue
+        if not m_tf: continue
         tf = m_tf.group(1).upper()
-        if tf not in ALLOWED_TFS:
-            continue
-
+        if tf not in ALLOWED_TFS: continue
         m_side = re.search(r"\b(BUY|SELL)\b", b, re.I)
         m_pair = re.search(r"on\s+([A-Z0-9]+)[/\-]([A-Z0-9]+)", b, re.I)
         m_entry= re.search(r"Price:\s*([0-9]*\.?[0-9]+)", b, re.I)
         m_tp1  = re.search(r"TP\s*1:\s*([0-9]*\.?[0-9]+)", b, re.I)
         m_tp2  = re.search(r"TP\s*2:\s*([0-9]*\.?[0-9]+)", b, re.I)
         m_sl   = re.search(r"\bSL\s*:\s*([0-9]*\.?[0-9]+)", b, re.I)
-        if not (m_side and m_pair and m_entry and m_tp1 and m_tp2 and m_sl):
-            continue
-
+        if not (m_side and m_pair and m_entry and m_tp1 and m_tp2 and m_sl): continue
         side = "long" if m_side.group(1).upper()=="BUY" else "short"
         base = m_pair.group(1).upper()
         quote= m_pair.group(2).upper()
-        if quote == "USD": quote = "USDT"
-
-        entry=float(m_entry.group(1)); tp1=float(m_tp1.group(1))
-        tp2=float(m_tp2.group(1));     sl=float(m_sl.group(1))
-
-        if side=="long"  and not (sl < entry < tp1 <= tp2): continue
-        if side=="short" and not (sl > entry > tp1 >= tp2): continue
-
-        entry=round_tick(base,entry); tp1=round_tick(base,tp1)
-        tp2=round_tick(base,tp2);     sl=round_tick(base,sl)
-
-        signals.append({
-            "base":base,"quote":quote,"side":side,
-            "entry":entry,"tp1":tp1,"tp2":tp2,"sl":sl,
-            "tf": tf
-        })
+        if quote == "USD": quote="USDT"
+        entry,tp1,tp2,sl = map(float,[m_entry.group(1),m_tp1.group(1),m_tp2.group(1),m_sl.group(1)])
+        signals.append({"base":base,"quote":quote,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"sl":sl,"tf":tf})
     return signals
 
-# ========= Leverage / Orders =========
+# ========= Orders =========
 def leverage_from_sl(entry: float, sl: float, side: str) -> int:
-    if side=="long":  sl_pct = (entry - sl)/entry*100.0
-    else:             sl_pct = (sl - entry)/entry*100.0
+    sl_pct = (entry-sl)/entry*100.0 if side=="long" else (sl-entry)/entry*100.0
     lev = int(SAFETY_PCT // max(0.0001, sl_pct))
-    lev = max(1, min(lev, MAX_LEV_CAP))
-    return lev
+    return max(1, min(lev, MAX_LEV_CAP))
 
 async def set_leverage(symbol: str, lev: int):
-    # ruft bybit(), das 110043 intern toleriert
     await bybit("/v5/position/set-leverage","POST",{
         "category":"linear","symbol":symbol,
         "buyLeverage": str(lev),"sellLeverage": str(lev)
     })
 
 async def place_entry_only(symbol: str, side: str, entry: float, notional_usdt: float):
-    """Nur Entry-Limit platzieren. TP/SL werden NACH (Teil-)Fill erzeugt."""
-    qty = max(0.001, round(notional_usdt/entry, 6))
+    filters = await get_symbol_filters(symbol)
+    step = filters["qtyStep"]; min_qty = filters["minOrderQty"]
+    raw_qty = max(min_qty, notional_usdt / entry)
+    qty = quantize_qty(raw_qty, step)
+    if qty < min_qty: qty = min_qty
     BY = "Buy" if side=="long" else "Sell"
     uid = hex(int(time.time()*1000))[2:]
     link_entry = f"ent_{symbol}_{uid}"
-
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":BY,
         "orderType":"Limit","price":str(entry),"qty":str(qty),
@@ -273,250 +219,98 @@ async def place_entry_only(symbol: str, side: str, entry: float, notional_usdt: 
     return link_entry, qty
 
 async def place_tp_sl_after_fill(symbol: str, side: str, size: float, tp1: float, tp2: float, sl: float):
-    """Nach Entry-(Teil)Fill: TP1/TP2 reduceOnly + StopLoss anlegen."""
+    filters = await get_symbol_filters(symbol)
+    step = filters["qtyStep"]; min_qty = filters["minOrderQty"]
+    pos_idx = 1 if side=="long" else 2
     OP = "Sell" if side=="long" else "Buy"
     uid = hex(int(time.time()*1000))[2:]
-    link_tp1 = f"tp1_{symbol}_{uid}"
-    link_tp2 = f"tp2_{symbol}_{uid}"
-    link_sl  = f"sl_{symbol}_{uid}"
-
-    q1 = max(0.001, round(size * (TP1_POS_PCT/100.0), 6))
-    q2 = max(0.001, round(size - q1, 6))
-
-    # TP1 / TP2
+    link_tp1,link_tp2,link_sl = f"tp1_{symbol}_{uid}",f"tp2_{symbol}_{uid}",f"sl_{symbol}_{uid}"
+    want_q1, want_q2 = size*(TP1_POS_PCT/100.0), size-size*(TP1_POS_PCT/100.0)
+    q1,q2 = quantize_qty(want_q1,step), quantize_qty(want_q2,step)
+    if q1<min_qty or q2<min_qty: q1=size; q2=0
+    # TP1
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
         "orderType":"Limit","price":str(tp1),"qty":str(q1),
-        "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp1
+        "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp1,"positionIdx":pos_idx
     })
-    await bybit("/v5/order/create","POST",{
-        "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Limit","price":str(tp2),"qty":str(q2),
-        "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2
-    })
-
-    # StopLoss (Stop-Market) – sichtbar & zuverlässig
-    trigDir = 2 if OP=="Sell" else 1
-    await bybit("/v5/order/create","POST",{
-        "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Market","reduceOnly":"true",
-        "triggerPrice":str(sl),"triggerDirection":trigDir,
-        "triggerBy":"LastPrice",
-        "stopOrderType":"StopLoss","timeInForce":"GTC",
-        "orderLinkId":link_sl
-    })
-    return link_tp1, link_tp2, link_sl
-
-async def order_status_by_link(symbol: str, link_id: str) -> Optional[str]:
-    res = await bybit("/v5/order/realtime","GET",{
-        "category":"linear","symbol":symbol,"orderLinkId":link_id
-    })
-    lst = res.get("list",[])
-    if not lst: return None
-    return lst[0].get("orderStatus")  # New / PartiallyFilled / Filled / Cancelled / Rejected
-
-async def set_stop_to_BE(symbol: str, side: str):
-    pos = await positions(symbol)
-    if not pos: return
-    avg = float(pos[0].get("avgPrice") or 0)
-    if avg <= 0: return
-    off = avg * 0.0002  # 2bp Offset
-    be  = (avg - off) if side=="long" else (avg + off)
-    await bybit("/v5/position/set-trading-stop","POST",{
-        "category":"linear","symbol":symbol,"tpSlMode":"Full","stopLoss": f"{be}"
-    })
-
-async def move_stop_to(symbol: str, price: float):
-    await bybit("/v5/position/set-trading-stop","POST",{
-        "category":"linear","symbol":symbol,"tpSlMode":"Full","stopLoss": f"{price}"
-    })
-
-async def cancel_order(symbol: str, link_id: str):
-    try:
-        await bybit("/v5/order/cancel","POST",{
-            "category":"linear","symbol":symbol,"orderLinkId":link_id
+    # TP2
+    if q2>=min_qty:
+        await bybit("/v5/order/create","POST",{
+            "category":"linear","symbol":symbol,"side":OP,
+            "orderType":"Limit","price":str(tp2),"qty":str(q2),
+            "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2,"positionIdx":pos_idx
         })
-    except Exception:
-        pass
+    else: link_tp2=None
+    # SL
+    await bybit("/v5/order/create","POST",{
+        "category":"linear","symbol":symbol,"side":OP,
+        "orderType":"Market","reduceOnly":"true","triggerPrice":str(sl),
+        "triggerDirection": (2 if OP=="Sell" else 1),
+        "triggerBy":"LastPrice","stopOrderType":"StopLoss","timeInForce":"GTC",
+        "orderLinkId":link_sl,"positionIdx":pos_idx
+    })
+    return link_tp1,link_tp2,link_sl
 
 # ========= Monitor-Loop =========
 async def monitor_loop():
     while True:
         await asyncio.sleep(5)
-
-        # Trading-Pause bis 00:00 UTC aufheben
-        if STATE.get("trading_paused_until"):
-            if datetime.now(timezone.utc) >= datetime.fromisoformat(STATE["trading_paused_until"]):
-                STATE["trading_paused_until"] = None
-
-        to_del = []
+        if STATE.get("trading_paused_until") and datetime.now(timezone.utc)>=datetime.fromisoformat(STATE["trading_paused_until"]):
+            STATE["trading_paused_until"]=None
+        to_del=[]
         for symbol, meta in list(STATE["open_watch"].items()):
-            # Entry-Expiry, solange Entry nicht filled
             if not meta.get("filled"):
-                # Ablaufzeit?
-                if now_ts() - meta["created_ts"] > meta.get("expiry_min", 60)*60:
-                    st = await order_status_by_link(symbol, meta["entry_id"])
-                    if st in ("New","PartiallyFilled"):
-                        await cancel_order(symbol, meta["entry_id"])
-                        to_del.append(symbol)
-                        continue
-
-                # Exits anlegen, sobald size>0 (egal ob Filled/PartiallyFilled)
+                if now_ts()-meta["created_ts"]>meta.get("expiry_min",60)*60:
+                    to_del.append(symbol); continue
                 size = await positions_size_symbol(symbol)
-                if size > 0:
-                    tp1_id, tp2_id, sl_id = await place_tp_sl_after_fill(
-                        symbol=symbol,
-                        side=meta["side"],
-                        size=size,
-                        tp1=meta["tp1_px"],
-                        tp2=meta["tp2_px"],
-                        sl=meta["sl_px"],
-                    )
-                    meta["tp1_id"] = tp1_id
-                    meta["tp2_id"] = tp2_id
-                    meta["sl_id"]  = sl_id
-                    meta["filled"] = True
-                    STATE["last_trade_ts"] = now_ts()  # Cooldown JETZT erst starten
-                    continue
-
-            # Nach Fill: TP/BE-Logik
-            if meta.get("filled"):
-                # TP1 filled -> SL -> BE
-                if not meta.get("did_be") and meta.get("tp1_id"):
-                    st_tp1 = await order_status_by_link(symbol, meta["tp1_id"])
-                    if st_tp1 == "Filled":
-                        await set_stop_to_BE(symbol, meta["side"])
-                        meta["did_be"] = True
-
-                # TP2 filled -> SL -> TP1 (Profit lock)
-                if not meta.get("did_tp2_move") and meta.get("tp2_id"):
-                    st_tp2 = await order_status_by_link(symbol, meta["tp2_id"])
-                    if st_tp2 == "Filled":
-                        await move_stop_to(symbol, meta["tp1_px"])
-                        meta["did_tp2_move"] = True
-
-                # Cleanup wenn Position geschlossen
+                if size>0:
+                    tp1,tp2,sl=await place_tp_sl_after_fill(symbol,meta["side"],size,meta["tp1_px"],meta["tp2_px"],meta["sl_px"])
+                    meta.update({"tp1_id":tp1,"tp2_id":tp2,"sl_id":sl,"filled":True})
+                    STATE["last_trade_ts"]=now_ts(); continue
+            else:
                 size = await positions_size_symbol(symbol)
-                if size == 0.0:
-                    to_del.append(symbol)
+                if size==0: to_del.append(symbol)
+        for s in to_del: STATE["open_watch"].pop(s,None)
 
-        for s in to_del:
-            STATE["open_watch"].pop(s, None)
-
-# Hintergrund starten
 asyncio.get_event_loop().create_task(monitor_loop())
 
-# ========= Guards & DD =========
-def in_cooldown() -> bool:
-    return (now_ts() - STATE.get("last_trade_ts", 0.0)) < COOLDOWN_MIN*60
-
+# ========= Guards =========
+def in_cooldown() -> bool: return (now_ts()-STATE.get("last_trade_ts",0.0))<COOLDOWN_MIN*60
 def trading_paused() -> bool:
-    pu = STATE.get("trading_paused_until")
-    return pu is not None and datetime.now(timezone.utc) < datetime.fromisoformat(pu)
-
-async def check_daily_dd_and_pause(pnl_delta: float = 0.0):
-    STATE["day_realized_pnl"] += pnl_delta
-    # optional: Equity & DD prüfen (vereinfacht)
-    eq = await get_wallet_equity()
-    if eq and STATE.get("day_start_equity") is None:
-        STATE["day_start_equity"] = eq
-    start_eq = STATE.get("day_start_equity") or eq
-    if start_eq and STATE["day_realized_pnl"] < 0:
-        dd = abs(STATE["day_realized_pnl"])/start_eq*100.0
-        if dd >= DD_LIMIT_PCT:
-            tomorrow = datetime.now(timezone.utc).date() + timedelta(days=1)
-            pu = datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc).isoformat()
-            STATE["trading_paused_until"] = pu
-            await close_all_positions()
-            return True
-    return False
-
-# ========= Payload-Text-Extractor =========
-def extract_text_from_payload(payload: dict) -> str:
-    node = payload
-    for part in TEXT_PATH.split("."):
-        if isinstance(node, dict) and part in node:
-            node = node[part]
-        else:
-            return ""
-    return node if isinstance(node, str) else ""
+    pu=STATE.get("trading_paused_until")
+    return pu and datetime.now(timezone.utc)<datetime.fromisoformat(pu)
 
 # ========= HTTP Endpoints =========
 @app.post("/webhook")
 async def webhook(request: Request):
-    """
-    Akzeptiert EITHER:
-      A) {"text": "...Signaltext...", "notional": 50}
-      B) rohen Discord-Forward-Payload; Signaltext liegt in TEXT_PATH (Default: "content")
-    """
-    if trading_paused():
-        raise HTTPException(423, "Trading paused (daily DD or schedule)")
+    if trading_paused(): raise HTTPException(423,"Trading paused")
+    body=await request.json()
+    text=(body.get("text") or extract_text_from_payload(body)).strip()
+    if not text: raise HTTPException(400,"No signal text found")
+    notional=float(body.get("notional") or DEFAULT_NOTION)
+    sigs=parse_signals(text)
+    if not sigs: raise HTTPException(422,"No valid signal")
+    counts=await count_open_filled()
+    side_preview=sigs[0]["side"]
+    if side_preview=="long" and counts["longs"]>=MAX_OPEN_LONGS: raise HTTPException(429,"Too many longs")
+    if side_preview=="short" and counts["shorts"]>=MAX_OPEN_SHORTS: raise HTTPException(429,"Too many shorts")
+    if in_cooldown(): raise HTTPException(429,"In cooldown")
+    sig=sigs[0]; base,quote,side=sig["base"],sig["quote"],sig["side"]
+    entry,tp1,tp2,sl=sig["entry"],sig["tp1"],sig["tp2"],sig["sl"]
+    symbol=f"{base}{quote}"
+    lev=leverage_from_sl(entry,sl,side); await set_leverage(symbol,lev)
+    entry_id,qty=await place_entry_only(symbol,side,entry,notional)
+    STATE["open_watch"][symbol]={"entry_id":entry_id,"side":side,"entry_px":entry,"tp1_px":tp1,"tp2_px":tp2,"sl_px":sl,"created_ts":now_ts(),"expiry_min":ENTRY_EXP_MIN,"filled":False}
+    return {"ok":True,"symbol":symbol,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"sl":sl,"leverage":lev,"entry_order_id":entry_id,"positions_open_counts":counts}
 
-    body = await request.json()
-
-    # Text finden
-    text = (body.get("text") or "").strip()
-    if not text:
-        text = extract_text_from_payload(body).strip()
-    if not text:
-        raise HTTPException(400, "No signal text found (neither 'text' nor TEXT_PATH)")
-
-    # Positionsgröße (Margin, ohne Hebel)
-    notional = float(body.get("notional") or DEFAULT_NOTION)
-
-    # TF filtern & erstes valides Setup
-    sigs = parse_signals(text)
-    if not sigs:
-        raise HTTPException(422, f"No valid signal for TFs {sorted(ALLOWED_TFS)} found")
-
-    # **Positions-Limits prüfen (nur gefüllte zählen)**
-    counts = await count_open_filled()
-    side_preview = "long" if sigs[0]["side"] == "long" else "short"
-    if side_preview == "long" and counts["longs"] >= MAX_OPEN_LONGS:
-        raise HTTPException(429, f"Max open longs reached ({counts['longs']}/{MAX_OPEN_LONGS})")
-    if side_preview == "short" and counts["shorts"] >= MAX_OPEN_SHORTS:
-        raise HTTPException(429, f"Max open shorts reached ({counts['shorts']}/{MAX_OPEN_SHORTS})")
-
-    # Cooldown nur blocken, wenn letzter Fill jung ist
-    if in_cooldown():
-        raise HTTPException(429, f"In cooldown ({COOLDOWN_MIN} min since last fill)")
-
-    # Nur das erste valide Setup umsetzen
-    sig = sigs[0]
-    base, quote, side = sig["base"], sig["quote"], sig["side"]
-    entry, tp1, tp2, sl = sig["entry"], sig["tp1"], sig["tp2"], sig["sl"]
-    symbol = f"{base}{quote}"  # Bybit Perp: z.B. SOLUSDT
-
-    # Hebel setzen
-    lev = leverage_from_sl(entry, sl, side)
-    await set_leverage(symbol, lev)
-
-    # DD-Check
-    paused = await check_daily_dd_and_pause(0.0)
-    if paused:
-        raise HTTPException(423, "Trading paused by daily drawdown")
-
-    # Nur Entry platzieren; TP/SL nach (Teil-)Fill
-    entry_id, qty = await place_entry_only(symbol, side, entry, notional_usdt=notional)
-
-    # Watch-Objekt für diesen Symbol-Trade
-    STATE["open_watch"][symbol] = {
-        "entry_id": entry_id, "side": side,
-        "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2, "sl_px": sl,
-        "created_ts": now_ts(), "expiry_min": ENTRY_EXP_MIN,
-        "filled": False, "did_be": False, "did_tp2_move": False
-    }
-
-    return {
-        "ok": True,
-        "symbol": symbol, "side": side,
-        "entry": entry, "tp1": tp1, "tp2": tp2, "sl": sl,
-        "leverage": lev,
-        "entry_order_id": entry_id,
-        "positions_open_counts": counts,
-        "note": "TP/SL werden nach (Teil-)Fill automatisch angelegt."
-    }
+def extract_text_from_payload(payload: dict) -> str:
+    node=payload
+    for part in TEXT_PATH.split("."):
+        if isinstance(node, dict) and part in node: node=node[part]
+        else: return ""
+    return node if isinstance(node,str) else ""
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "paused": trading_paused(), "watch": list(STATE["open_watch"].keys())}
+    return {"ok":True,"paused":trading_paused(),"watch":list(STATE["open_watch"].keys())}
