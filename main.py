@@ -10,17 +10,17 @@ BYBIT_BASE     = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
 BYBIT_KEY      = os.getenv("BYBIT_KEY", "")
 BYBIT_SECRET   = os.getenv("BYBIT_SECRET", "")
 
-# Timeframe-Filter (nur diese werden gehandelt), z.B. "H1" oder "H1,H4"
+# Timeframe-Filter, z.B. "H1" oder "H1,H4,M15"
 ALLOWED_TFS    = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
 
 # Positionslogik
 TP1_POS_PCT    = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
 TP2_POS_PCT    = float(os.getenv("TP2_POS_PCT", "80"))
 MAX_LEV_CAP    = int(os.getenv("MAX_LEV_CAP", "75"))
-SAFETY_PCT     = float(os.getenv("SAFETY_PCT", "80"))      # Hebel = floor(SAFETY_PCT / SL%)
+SAFETY_PCT     = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
 
 # Guards
-COOLDOWN_MIN   = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown
+COOLDOWN_MIN   = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min.)
 ENTRY_EXP_MIN  = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
 DD_LIMIT_PCT   = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
 
@@ -36,20 +36,18 @@ STATE: Dict[str, Any] = {
     "last_trade_ts": 0.0,
     "trading_paused_until": None,     # iso-zeit
     "day_key": None,                  # "YYYY-MM-DD"
-    "day_start_equity": None,         # USDT (optional)
-    "day_realized_pnl": 0.0,          # USDT (vereinfachte Summierung)
+    "day_start_equity": None,         # USDT
+    "day_realized_pnl": 0.0,          # (vereinfachte) Summe
     "open_watch": {}                  # symbol -> meta (ids, preise, flags)
 }
 
-# grobe Tick-Rundung je Coin (bei Bedarf erweitern)
+# Tick-Rundung je Coin (bei Bedarf erweitern)
 TICK_DECIMALS = {
     "SHIB": 8, "DOGE": 5, "XRP": 4, "SOL": 2, "AVAX": 3, "AAVE": 2, "LINK": 3,
     "BTC": 2, "ETH": 2, "BNB": 2, "LTC": 2, "ADA": 5, "MATIC": 5, "EOS": 4, "BCH": 2, "ATOM": 3, "ALGO": 5
 }
 
 def now_ts() -> float: return time.time()
-def today_key() -> str: return datetime.now(timezone.utc).date().isoformat()
-
 def round_tick(base: str, v: float) -> float:
     d = TICK_DECIMALS.get(base, 4)
     p = 10 ** d
@@ -59,7 +57,7 @@ def round_tick(base: str, v: float) -> float:
 @app.on_event("startup")
 async def _startup():
     global _httpx_client
-    _httpx_client = httpx.AsyncClient(timeout=10.0)
+    _httpx_client = httpx.AsyncClient(timeout=12.0)
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -68,28 +66,57 @@ async def _shutdown():
         await _httpx_client.aclose()
         _httpx_client = None
 
+# ========= Bybit v5 Client (Header-Sign) =========
 def _qs(params: Dict[str, Any]) -> str:
-    # Bybit v5 expects query string by key order (stabil durch Python 3.7+ dict)
-    return "&".join(f"{k}={str(v)}" for k, v in params.items() if v is not None and v != "")
+    """Alphabetisch sortierter k=v&k2=v2 Querystring NUR aus endpoint-Params (ohne api_key/timestamp/recv_window)."""
+    items = [(k, str(v)) for k, v in params.items() if v is not None and v != ""]
+    items.sort(key=lambda kv: kv[0])
+    return "&".join(f"{k}={v}" for k, v in items)
 
 async def bybit(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v5 Header-Signatur (SignType=2):
+      prehash = timestamp + api_key + recv_window + (querystring for GET | raw json for POST)
+      Headers: X-BAPI-API-KEY, X-BAPI-SIGN, X-BAPI-SIGN-TYPE=2, X-BAPI-TIMESTAMP, X-BAPI-RECV-WINDOW
+    """
     if not BYBIT_KEY or not BYBIT_SECRET:
         raise HTTPException(500, "BYBIT_KEY/SECRET not set")
     global _httpx_client
     if not _httpx_client:
         raise HTTPException(500, "HTTP client not ready")
 
-    payload = {
-        **params,
-        "api_key": BYBIT_KEY,
-        "timestamp": str(int(now_ts()*1000)),
-        "recv_window": "5000"
+    ts = str(int(now_ts() * 1000))
+    recv = "5000"
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_KEY,
+        "X-BAPI-SIGN-TYPE": "2",
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json",
     }
-    q = _qs(payload)
-    sig = hmac.new(BYBIT_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
-    url = f"{BYBIT_BASE}{path}?{q}&sign={sig}"
-    r = await _httpx_client.request(method, url)
-    data = r.json()
+
+    if method.upper() == "GET":
+        q = _qs(params)
+        prehash = ts + BYBIT_KEY + recv + q
+        sign = hmac.new(BYBIT_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+        headers["X-BAPI-SIGN"] = sign
+        url = f"{BYBIT_BASE}{path}"
+        if q:
+            url += f"?{q}"
+        r = await _httpx_client.get(url, headers=headers)
+    else:
+        body = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+        prehash = ts + BYBIT_KEY + recv + body
+        sign = hmac.new(BYBIT_SECRET.encode(), prehash.encode(), hashlib.sha256).hexdigest()
+        headers["X-BAPI-SIGN"] = sign
+        url = f"{BYBIT_BASE}{path}"
+        r = await _httpx_client.post(url, headers=headers, content=body.encode("utf-8"))
+
+    try:
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, f"Bybit non-JSON response ({r.status_code}): {r.text[:200]}")
+
     if r.status_code != 200 or data.get("retCode") != 0:
         raise HTTPException(502, f"Bybit error {data.get('retCode')}: {data.get('retMsg')}, {data}")
     return data.get("result", {}) or {}
@@ -123,7 +150,7 @@ async def close_all_positions():
             opp = "Sell" if side=="Buy" else "Buy"
             tasks.append(bybit("/v5/order/create","POST",{
                 "category":"linear","symbol":sym,"side":opp,"orderType":"Market",
-                "reduceOnly":"true","qty":sz
+                "reduceOnly":"true","qty":str(sz)
             }))
     if tasks: await asyncio.gather(*tasks)
 
@@ -135,8 +162,7 @@ def parse_signals(text: str):
     Rückgabe: Liste [{base, quote, side, entry, tp1, tp2, sl, tf}]
     """
     txt = text.replace("\r","")
-    # grob in Blöcke splitten (leere Zeile trennt Setups zuverlässig genug)
-    blocks = re.split(r"\n\s*\n", txt.strip())
+    blocks = re.split(r"\n\s*\n", txt.strip())  # grob in Blöcke splitten
     signals = []
     for b in blocks:
         m_tf = re.search(r"Timeframe:\s*([A-Za-z0-9]+)", b, re.I)
@@ -194,7 +220,7 @@ async def set_leverage(symbol: str, lev: int):
 
 async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: float, sl: float,
                        notional_usdt: float):
-    # Menge: grob notional/entry (Bybit stepSizes je nach Symbol; 6 Dezimalen decken vieles ab)
+    # Größe ~ notional/entry (Bybit stepSizes variieren; 6 Dezimalen decken vieles ab)
     qty = max(0.001, round(notional_usdt/entry, 6))
     BY = "Buy" if side=="long" else "Sell"
     OP = "Sell" if BY=="Buy" else "Buy"
@@ -208,7 +234,7 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
     # Entry Limit
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":BY,
-        "orderType":"Limit","price":entry,"qty":qty,
+        "orderType":"Limit","price":str(entry),"qty":str(qty),
         "timeInForce":"GTC","reduceOnly":"false","orderLinkId":link_entry
     })
 
@@ -218,12 +244,12 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
 
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Limit","price":tp1,"qty":q1,
+        "orderType":"Limit","price":str(tp1),"qty":str(q1),
         "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp1
     })
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Limit","price":tp2,"qty":q2,
+        "orderType":"Limit","price":str(tp2),"qty":str(q2),
         "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2
     })
 
@@ -232,7 +258,7 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
         "orderType":"Market","reduceOnly":"true",
-        "triggerPrice":sl,"triggerDirection":trigDir,
+        "triggerPrice":str(sl),"triggerDirection":trigDir,
         "stopOrderType":"StopLoss","timeInForce":"GTC",
         "orderLinkId":link_sl
     })
@@ -259,8 +285,7 @@ async def set_stop_to_BE(symbol: str, side: str):
     if not pos: return
     avg = float(pos[0].get("avgPrice") or 0)
     if avg <= 0: return
-    # mini offset (1–2bp), damit BE sofort greift
-    off = avg * 0.0002
+    off = avg * 0.0002  # 2bp Offset
     be  = (avg - off) if side=="long" else (avg + off)
     await bybit("/v5/position/set-trading-stop","POST",{
         "category":"linear","symbol":symbol,"tpSlMode":"Full","stopLoss": f"{be}"
@@ -284,7 +309,7 @@ async def monitor_loop():
     while True:
         await asyncio.sleep(5)
 
-        # Trading-Pause bis 00:00 aufheben
+        # Trading-Pause bis 00:00 UTC aufheben
         if STATE.get("trading_paused_until"):
             if datetime.now(timezone.utc) >= datetime.fromisoformat(STATE["trading_paused_until"]):
                 STATE["trading_paused_until"] = None
@@ -335,7 +360,6 @@ def trading_paused() -> bool:
     return pu is not None and datetime.now(timezone.utc) < datetime.fromisoformat(pu)
 
 async def check_daily_dd_and_pause(pnl_delta: float = 0.0):
-    # vereinfachte PnL-Summe; optional Wallet-Equity für Schwelle
     STATE["day_realized_pnl"] += pnl_delta
     eq = await get_wallet_equity()
     if eq and STATE.get("day_start_equity") is None:
@@ -367,8 +391,8 @@ def extract_text_from_payload(payload: dict) -> str:
 async def webhook(request: Request):
     """
     Akzeptiert EITHER:
-      A) {"text": "...ganzer Signal-Text...", "notional": 50}
-      B) rohen Discord-Forward-Payload mit Text im Feld TEXT_PATH (Default: "content")
+      A) {"text": "...Signaltext...", "notional": 50}
+      B) rohen Discord-Forward-Payload; Signaltext liegt in TEXT_PATH (Default: "content")
     """
     if trading_paused():
         raise HTTPException(423, "Trading paused (daily DD or schedule)")
@@ -385,10 +409,10 @@ async def webhook(request: Request):
     # Positionsgröße
     notional = float(body.get("notional") or DEFAULT_NOTION)
 
-    # H1/H4 filtern & erstes valides Setup
+    # TF filtern & erstes valides Setup
     sigs = parse_signals(text)
     if not sigs:
-        raise HTTPException(422, "No valid H1/H4 signal found")
+        raise HTTPException(422, f"No valid signal for TFs {sorted(ALLOWED_TFS)} found")
 
     if in_cooldown():
         raise HTTPException(429, f"In cooldown ({COOLDOWN_MIN} min)")
@@ -396,7 +420,7 @@ async def webhook(request: Request):
     sig = sigs[0]
     base, quote, side = sig["base"], sig["quote"], sig["side"]
     entry, tp1, tp2, sl = sig["entry"], sig["tp1"], sig["tp2"], sig["sl"]
-    symbol = f"{base}{quote}"  # Bybit linear: e.g. SOLUSDT
+    symbol = f"{base}{quote}"  # Bybit Perp: e.g. SOLUSDT
 
     lev = leverage_from_sl(entry, sl, side)
     await set_leverage(symbol, lev)
