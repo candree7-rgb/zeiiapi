@@ -55,6 +55,8 @@ def round_tick(base: str, v: float) -> float:
 async def _startup():
     global _httpx_client
     _httpx_client = httpx.AsyncClient(timeout=15.0)
+    # Start monitor loop
+    asyncio.create_task(monitor_loop())
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -131,6 +133,21 @@ async def count_open_filled() -> Dict[str,int]:
         elif side == "sell": shorts += 1
     return {"longs": longs, "shorts": shorts}
 
+async def get_order_status(symbol: str, order_link_id: str) -> Optional[str]:
+    """Get order status by orderLinkId"""
+    try:
+        res = await bybit("/v5/order/realtime", "GET", {
+            "category": "linear",
+            "symbol": symbol,
+            "orderLinkId": order_link_id
+        })
+        order_list = res.get("list", [])
+        if order_list:
+            return order_list[0].get("orderStatus")
+    except:
+        pass
+    return None
+
 # ========= Parser =========
 def parse_signals(text: str):
     txt = text.replace("\r","")
@@ -179,76 +196,272 @@ async def place_entry(symbol: str, side: str, entry: float, notional_usdt: float
     })
     return link_entry, qty
 
-async def place_tp_sl(symbol:str, side:str, size:float, tp1:float, tp2:float, sl:float):
+async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: float, sl: float):
+    """Place TP1, TP2 and SL orders"""
     OP = "Sell" if side=="long" else "Buy"
     uid = hex(int(now_ts()*1000))[2:]
-    link_tp1, link_tp2, link_sl = f"tp1_{symbol}_{uid}", f"tp2_{symbol}_{uid}", f"sl_{symbol}_{uid}"
+    link_tp1 = f"tp1_{symbol}_{uid}"
+    link_tp2 = f"tp2_{symbol}_{uid}"
+    link_sl = f"sl_{symbol}_{uid}"
+    
+    # Calculate quantities
     q1 = max(0.001, round(size * (TP1_POS_PCT/100.0), 6))
     q2 = max(0.001, round(size - q1, 6))
-    # TP1
-    await bybit("/v5/order/create","POST",{"category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Limit","price":str(tp1),"qty":str(q1),"reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp1})
-    # TP2
-    await bybit("/v5/order/create","POST",{"category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Limit","price":str(tp2),"qty":str(q2),"reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2})
-    # SL
-    trigDir = 2 if OP=="Sell" else 1
-    await bybit("/v5/order/create","POST",{"category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Market","reduceOnly":"true","triggerPrice":str(sl),
-        "triggerDirection":trigDir,"triggerBy":"LastPrice","stopOrderType":"StopLoss",
-        "timeInForce":"GTC","orderLinkId":link_sl})
+    
+    # Place TP1 (20% of position)
+    await bybit("/v5/order/create","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "side":OP,
+        "orderType":"Limit",
+        "price":str(tp1),
+        "qty":str(q1),
+        "reduceOnly":"true",
+        "timeInForce":"GTC",
+        "orderLinkId":link_tp1
+    })
+    
+    # Place TP2 (80% of position)
+    await bybit("/v5/order/create","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "side":OP,
+        "orderType":"Limit",
+        "price":str(tp2),
+        "qty":str(q2),
+        "reduceOnly":"true",
+        "timeInForce":"GTC",
+        "orderLinkId":link_tp2
+    })
+    
+    # Place SL (full position initially)
+    trigDir = 2 if OP=="Sell" else 1  # 1=rise for buy stop, 2=fall for sell stop
+    await bybit("/v5/order/create","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "side":OP,
+        "orderType":"Market",
+        "qty":str(size),  # Full position size for SL
+        "reduceOnly":"true",
+        "triggerPrice":str(sl),
+        "triggerDirection":trigDir,
+        "triggerBy":"LastPrice",
+        "stopOrderType":"Stop",
+        "timeInForce":"IOC",
+        "orderLinkId":link_sl
+    })
+    
     return link_tp1, link_tp2, link_sl
+
+async def cancel_order(symbol: str, order_link_id: str):
+    """Cancel an order by orderLinkId"""
+    try:
+        await bybit("/v5/order/cancel","POST",{
+            "category":"linear",
+            "symbol":symbol,
+            "orderLinkId":order_link_id
+        })
+    except:
+        pass  # Order might already be filled or cancelled
+
+async def move_sl_to_be(symbol: str, side: str, entry_price: float, remaining_size: float):
+    """Move stop loss to break even"""
+    OP = "Sell" if side=="long" else "Buy"
+    trigDir = 2 if OP=="Sell" else 1
+    uid = hex(int(now_ts()*1000))[2:]
+    link_sl_be = f"sl_be_{symbol}_{uid}"
+    
+    await bybit("/v5/order/create","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "side":OP,
+        "orderType":"Market",
+        "qty":str(remaining_size),
+        "reduceOnly":"true",
+        "triggerPrice":str(entry_price),  # Break even = entry price
+        "triggerDirection":trigDir,
+        "triggerBy":"LastPrice",
+        "stopOrderType":"Stop",
+        "timeInForce":"IOC",
+        "orderLinkId":link_sl_be
+    })
+    
+    return link_sl_be
 
 # ========= Monitor Loop =========
 async def monitor_loop():
+    """Monitor positions and manage SL to BE after TP1"""
     while True:
         await asyncio.sleep(5)
         to_del = []
+        
         for symbol, meta in list(STATE["open_watch"].items()):
-            if not meta.get("exits_set"):
-                size = await positions_size_symbol(symbol)
-                if size > 0:
-                    tp1_id,tp2_id,sl_id = await place_tp_sl(symbol, meta["side"], size,
-                                                           meta["tp1_px"], meta["tp2_px"], meta["sl_px"])
-                    meta.update({"tp1_id":tp1_id,"tp2_id":tp2_id,"sl_id":sl_id,"exits_set":True})
-                    STATE["last_trade_ts"] = now_ts()
-            else:
-                # cleanup wenn pos geschlossen
-                if await positions_size_symbol(symbol) == 0.0:
+            try:
+                # Phase 1: Wait for position to open and set exits
+                if not meta.get("exits_set"):
+                    size = await positions_size_symbol(symbol)
+                    if size > 0:
+                        # Position opened, place exit orders
+                        tp1_id, tp2_id, sl_id = await place_tp_sl(
+                            symbol, meta["side"], size,
+                            meta["tp1_px"], meta["tp2_px"], meta["sl_px"]
+                        )
+                        meta.update({
+                            "tp1_id": tp1_id,
+                            "tp2_id": tp2_id,
+                            "sl_id": sl_id,
+                            "exits_set": True,
+                            "tp1_hit": False,
+                            "sl_moved_to_be": False,
+                            "position_size": size
+                        })
+                        STATE["last_trade_ts"] = now_ts()
+                        print(f"✅ Exit orders placed for {symbol}")
+                
+                # Phase 2: Monitor TP1 and move SL to BE
+                elif meta.get("exits_set") and not meta.get("tp1_hit"):
+                    # Check if TP1 was filled
+                    tp1_status = await get_order_status(symbol, meta["tp1_id"])
+                    
+                    if tp1_status == "Filled":
+                        meta["tp1_hit"] = True
+                        print(f"🎯 TP1 hit for {symbol}, moving SL to BE...")
+                        
+                        # Get remaining position size
+                        remaining_size = await positions_size_symbol(symbol)
+                        
+                        if remaining_size > 0 and not meta.get("sl_moved_to_be"):
+                            # Cancel old SL
+                            await cancel_order(symbol, meta["sl_id"])
+                            
+                            # Place new SL at break even
+                            new_sl_id = await move_sl_to_be(
+                                symbol, meta["side"], 
+                                meta["entry_px"], remaining_size
+                            )
+                            
+                            meta["sl_id"] = new_sl_id
+                            meta["sl_moved_to_be"] = True
+                            print(f"✅ SL moved to BE for {symbol}")
+                
+                # Phase 3: Check if position is closed
+                current_size = await positions_size_symbol(symbol)
+                if current_size == 0.0:
                     to_del.append(symbol)
-        for s in to_del: STATE["open_watch"].pop(s,None)
-
-asyncio.get_event_loop().create_task(monitor_loop())
+                    print(f"🏁 Position closed for {symbol}")
+                    
+            except Exception as e:
+                print(f"❌ Error monitoring {symbol}: {e}")
+        
+        # Clean up closed positions
+        for s in to_del:
+            STATE["open_watch"].pop(s, None)
 
 # ========= Guards =========
 def in_cooldown() -> bool:
     return (now_ts() - STATE.get("last_trade_ts",0.0)) < COOLDOWN_MIN*60
 
-# ========= HTTP =========
+# ========= HTTP Endpoints =========
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.json()
     text = (body.get("text") or extract_text_from_payload(body)).strip()
-    if not text: raise HTTPException(400,"No signal text")
+    if not text: 
+        raise HTTPException(400, "No signal text")
+    
     sigs = parse_signals(text)
-    if not sigs: raise HTTPException(422,"No valid signal")
+    if not sigs: 
+        raise HTTPException(422, "No valid signal")
+    
     sig = sigs[0]
-    base,quote,side,entry,tp1,tp2,sl = sig["base"],sig["quote"],sig["side"],sig["entry"],sig["tp1"],sig["tp2"],sig["sl"]
-    symbol=f"{base}{quote}"
-    if in_cooldown(): raise HTTPException(429,"Cooldown active")
-    lev=leverage_from_sl(entry,sl,side)
-    await set_leverage(symbol,lev)
-    entry_id,qty=await place_entry(symbol,side,entry,float(body.get("notional") or DEFAULT_NOTION))
-    STATE["open_watch"][symbol]={"entry_id":entry_id,"side":side,"tp1_px":tp1,"tp2_px":tp2,"sl_px":sl,"exits_set":False}
-    return {"ok":True,"symbol":symbol,"entry":entry,"tp1":tp1,"tp2":tp2,"sl":sl,"leverage":lev,"entry_order_id":entry_id}
+    base = sig["base"]
+    quote = sig["quote"]
+    side = sig["side"]
+    entry = sig["entry"]
+    tp1 = sig["tp1"]
+    tp2 = sig["tp2"]
+    sl = sig["sl"]
+    symbol = f"{base}{quote}"
+    
+    # Check cooldown
+    if in_cooldown(): 
+        raise HTTPException(429, "Cooldown active")
+    
+    # Check max open positions
+    counts = await count_open_filled()
+    if side == "long" and counts["longs"] >= MAX_OPEN_LONGS:
+        raise HTTPException(429, f"Max open longs ({MAX_OPEN_LONGS}) reached")
+    if side == "short" and counts["shorts"] >= MAX_OPEN_SHORTS:
+        raise HTTPException(429, f"Max open shorts ({MAX_OPEN_SHORTS}) reached")
+    
+    # Calculate leverage and set it
+    lev = leverage_from_sl(entry, sl, side)
+    await set_leverage(symbol, lev)
+    
+    # Place entry order
+    notional = float(body.get("notional") or DEFAULT_NOTION)
+    entry_id, qty = await place_entry(symbol, side, entry, notional)
+    
+    # Track position for monitoring
+    STATE["open_watch"][symbol] = {
+        "entry_id": entry_id,
+        "side": side,
+        "entry_px": entry,  # Store entry price for BE
+        "tp1_px": tp1,
+        "tp2_px": tp2,
+        "sl_px": sl,
+        "exits_set": False
+    }
+    
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "tp1": tp1,
+        "tp2": tp2,
+        "sl": sl,
+        "leverage": lev,
+        "notional": notional,
+        "entry_order_id": entry_id
+    }
 
 def extract_text_from_payload(payload: dict) -> str:
-    node=payload
+    node = payload
     for part in TEXT_PATH.split("."):
-        if isinstance(node,dict) and part in node: node=node[part]
-        else: return ""
-    return node if isinstance(node,str) else ""
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        else:
+            return ""
+    return node if isinstance(node, str) else ""
 
 @app.get("/health")
 async def health():
-    return {"ok":True,"watch":list(STATE["open_watch"].keys())}
+    return {
+        "ok": True,
+        "watching": list(STATE["open_watch"].keys()),
+        "count": len(STATE["open_watch"])
+    }
+
+@app.get("/status")
+async def status():
+    """Get detailed status of all watched positions"""
+    positions_info = []
+    for symbol, meta in STATE["open_watch"].items():
+        size = await positions_size_symbol(symbol)
+        positions_info.append({
+            "symbol": symbol,
+            "side": meta["side"],
+            "current_size": size,
+            "exits_set": meta.get("exits_set", False),
+            "tp1_hit": meta.get("tp1_hit", False),
+            "sl_moved_to_be": meta.get("sl_moved_to_be", False)
+        })
+    
+    return {
+        "ok": True,
+        "in_cooldown": in_cooldown(),
+        "positions": positions_info
+    }
+
+# Run with: uvicorn main:app --reload --host 0.0.0.0 --port 8000
