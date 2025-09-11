@@ -6,31 +6,32 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
-BYBIT_BASE      = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
-BYBIT_KEY       = os.getenv("BYBIT_KEY", "")
-BYBIT_SECRET    = os.getenv("BYBIT_SECRET", "")
+BYBIT_BASE       = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
+BYBIT_KEY        = os.getenv("BYBIT_KEY", "")
+BYBIT_SECRET     = os.getenv("BYBIT_SECRET", "")
+SETTLE_COIN      = os.getenv("SETTLE_COIN", "USDT")  # <- NEU: für /v5/position/list ohne symbol
 
 # Timeframe-Filter, z.B. "H1" oder "H1,H4,M15"
-ALLOWED_TFS     = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
+ALLOWED_TFS      = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
 
 # Positionslogik
-TP1_POS_PCT     = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
-TP2_POS_PCT     = float(os.getenv("TP2_POS_PCT", "80"))
-MAX_LEV_CAP     = int(os.getenv("MAX_LEV_CAP", "75"))
-SAFETY_PCT      = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
+TP1_POS_PCT      = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
+TP2_POS_PCT      = float(os.getenv("TP2_POS_PCT", "80"))
+MAX_LEV_CAP      = int(os.getenv("MAX_LEV_CAP", "75"))
+SAFETY_PCT       = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
 
 # Guards
-COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min., ab Fill)
-ENTRY_EXP_MIN   = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
-DD_LIMIT_PCT    = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
+COOLDOWN_MIN     = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min., ab Fill)
+ENTRY_EXP_MIN    = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
+DD_LIMIT_PCT     = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
 
 # Positions-Limits (nur wirklich gefüllte Positionen werden gezählt)
-MAX_OPEN_LONGS  = int(os.getenv("MAX_OPEN_LONGS", "999"))
-MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "999"))
+MAX_OPEN_LONGS   = int(os.getenv("MAX_OPEN_LONGS", "999"))
+MAX_OPEN_SHORTS  = int(os.getenv("MAX_OPEN_SHORTS", "999"))
 
 # Eingangs-Payload: wo liegt der Text? (bei rohem Discord-JSON meist "content")
-TEXT_PATH       = os.getenv("TEXT_PATH", "content")
-DEFAULT_NOTION  = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
+TEXT_PATH        = os.getenv("TEXT_PATH", "content")
+DEFAULT_NOTION   = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
 
 # ========= App / State =========
 app = FastAPI()
@@ -141,8 +142,15 @@ async def get_wallet_equity() -> Optional[float]:
     return None
 
 async def positions(symbol: Optional[str] = None):
+    """
+    Holt Positionsliste. Falls kein symbol übergeben wird, hängen wir settleCoin an,
+    weil einige Konten ansonsten 10001 (Missing symbol or settleCoin) liefern.
+    """
     params = {"category":"linear"}
-    if symbol: params["symbol"] = symbol
+    if symbol:
+        params["symbol"] = symbol
+    else:
+        params["settleCoin"] = SETTLE_COIN  # <- WICHTIG
     res = await bybit("/v5/position/list", "GET", params)
     return res.get("list", [])
 
@@ -156,12 +164,12 @@ async def positions_size_symbol(symbol: str) -> float:
 
 async def count_open_filled() -> Dict[str, int]:
     """Zähle gefüllte Positionen (size>0) getrennt nach long/short."""
-    res = await positions()
+    res = await positions()  # liefert dank settleCoin jetzt sicher Ergebnisse
     longs = shorts = 0
     for p in res:
         try:
             sz = float(p.get("size") or 0)
-            if sz <= 0: 
+            if sz <= 0:
                 continue
             side = (p.get("side") or "").lower()  # "Buy"/"Sell"
             if side == "buy":
@@ -287,7 +295,7 @@ async def place_tp_sl_after_fill(symbol: str, side: str, size: float, tp1: float
         "reduceOnly":"true","timeInForce":"GTC","orderLinkId":link_tp2
     })
 
-    # StopLoss (Stop-Market)
+    # StopLoss (Stop-Market) – sichtbar & zuverlässig
     trigDir = 2 if OP=="Sell" else 1
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
