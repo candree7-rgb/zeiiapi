@@ -33,7 +33,7 @@ app = FastAPI()
 _httpx_client: Optional[httpx.AsyncClient] = None
 
 STATE: Dict[str, Any] = {
-    "last_trade_ts": 0.0,
+    "last_trade_ts": 0.0,             # Cooldown-Start (erst bei Entry-Fill)
     "trading_paused_until": None,     # iso-zeit
     "day_key": None,                  # "YYYY-MM-DD"
     "day_start_equity": None,         # USDT
@@ -265,8 +265,10 @@ async def place_orders(symbol: str, side: str, entry: float, tp1: float, tp2: fl
         "tp1_id": link_tp1, "tp2_id": link_tp2, "sl_id": link_sl,
         "entry_id": link_entry, "side": side,
         "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2,
+        "qty": qty,
         "created_ts": now_ts(), "expiry_min": ENTRY_EXP_MIN,
-        "did_be": False, "did_tp2_move": False
+        "did_be": False, "did_tp2_move": False,
+        "marked_filled": False
     }
     return {"entry":link_entry,"tp1":link_tp1,"tp2":link_tp2,"sl":link_sl,"qty":qty}
 
@@ -315,20 +317,44 @@ async def monitor_loop():
         # Entries expiren; BE/TP2-Moves; Cleanup
         to_del = []
         for symbol, meta in list(STATE["open_watch"].items()):
-            # Entry-Expiry
-            if now_ts() - meta["created_ts"] > meta.get("expiry_min", 60)*60:
-                st = await order_status_by_link(symbol, meta["entry_id"])
-                if st in ("New","PartiallyFilled"):
-                    await cancel_order(symbol, meta["entry_id"])
+            # Entry Status
+            st_entry = await order_status_by_link(symbol, meta["entry_id"])
 
-            # TP1 filled -> SL -> BE
+            # a) Cooldown erst bei tatsächlichem Fill
+            if st_entry == "Filled" and not meta.get("marked_filled"):
+                STATE["last_trade_ts"] = now_ts()
+                meta["marked_filled"] = True
+
+            # b) Entry manuell gecancelt? -> bis Expiry neu setzen
+            still_in_window = (now_ts() - meta["created_ts"] < meta.get("expiry_min", 60) * 60)
+            if st_entry == "Cancelled" and still_in_window and not meta.get("marked_filled"):
+                new_id = f"ent_{symbol}_{int(now_ts()*1000)}"
+                BY = "Buy" if meta["side"] == "long" else "Sell"
+                await bybit("/v5/order/create","POST",{
+                    "category":"linear","symbol":symbol,"side":BY,
+                    "orderType":"Limit","price":str(meta["entry_px"]), "qty":str(meta["qty"]),
+                    "timeInForce":"GTC","reduceOnly":"false","orderLinkId":new_id
+                })
+                meta["entry_id"] = new_id
+                # nächster Loop prüft erneut
+                continue
+
+            # c) Entry Expiry: ungefüllte Entry nach Ablauf löschen
+            if not meta.get("marked_filled") and not still_in_window:
+                if st_entry in ("New","PartiallyFilled"):
+                    await cancel_order(symbol, meta["entry_id"])
+                to_del.append(symbol)
+                continue
+
+            # --- TP/SL Nachlogik nur nach Fill sinnvoll ---
+            # TP1 -> SL auf BE, alten SL löschen
             st_tp1 = await order_status_by_link(symbol, meta["tp1_id"])
             if st_tp1 == "Filled" and not meta.get("did_be"):
                 await set_stop_to_BE(symbol, meta["side"])
-                await cancel_order(symbol, meta["sl_id"])  # alte SL raus
+                await cancel_order(symbol, meta["sl_id"])
                 meta["did_be"] = True
 
-            # TP2 filled -> SL -> TP1 (Profit lock)
+            # TP2 -> Stop auf TP1 (Profit lock)
             st_tp2 = await order_status_by_link(symbol, meta["tp2_id"])
             if st_tp2 == "Filled" and not meta.get("did_tp2_move"):
                 await move_stop_to(symbol, meta["tp1_px"])
@@ -338,10 +364,11 @@ async def monitor_loop():
             pos = await positions(symbol)
             if pos:
                 sz = float(pos[0].get("size") or 0)
-                if sz == 0:
+                if sz == 0 and meta.get("marked_filled"):
                     to_del.append(symbol)
             else:
-                to_del.append(symbol)
+                if meta.get("marked_filled"):
+                    to_del.append(symbol)
 
         for s in to_del:
             STATE["open_watch"].pop(s, None)
@@ -403,7 +430,7 @@ async def webhook(request: Request):
     if not text:
         raise HTTPException(400, "No signal text found (neither 'text' nor TEXT_PATH)")
 
-    # Positionsgröße
+    # Positionsgröße (USDT)
     notional = float(body.get("notional") or DEFAULT_NOTION)
 
     # TF filtern & erstes valides Setup
@@ -417,7 +444,7 @@ async def webhook(request: Request):
     sig = sigs[0]
     base, quote, side = sig["base"], sig["quote"], sig["side"]
     entry, tp1, tp2, sl = sig["entry"], sig["tp1"], sig["tp2"], sig["sl"]
-    symbol = f"{base}{quote}"  # Bybit Perp: e.g. SOLUSDT
+    symbol = f"{base}{quote}"  # Bybit Perp: z.B. SOLUSDT
 
     lev = leverage_from_sl(entry, sl, side)
     await set_leverage(symbol, lev)
@@ -427,7 +454,6 @@ async def webhook(request: Request):
         raise HTTPException(423, "Trading paused by daily drawdown")
 
     res = await place_orders(symbol, side, entry, tp1, tp2, sl, notional_usdt=notional)
-    STATE["last_trade_ts"] = now_ts()
 
     return {
         "ok": True,
