@@ -6,27 +6,31 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
-BYBIT_BASE     = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
-BYBIT_KEY      = os.getenv("BYBIT_KEY", "")
-BYBIT_SECRET   = os.getenv("BYBIT_SECRET", "")
+BYBIT_BASE      = os.getenv("BYBIT_BASE", "https://api-testnet.bybit.com")
+BYBIT_KEY       = os.getenv("BYBIT_KEY", "")
+BYBIT_SECRET    = os.getenv("BYBIT_SECRET", "")
 
 # Timeframe-Filter, z.B. "H1" oder "H1,H4,M15"
-ALLOWED_TFS    = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
+ALLOWED_TFS     = set(os.getenv("ALLOWED_TFS", "H1").replace(" ", "").split(","))
 
 # Positionslogik
-TP1_POS_PCT    = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
-TP2_POS_PCT    = float(os.getenv("TP2_POS_PCT", "80"))
-MAX_LEV_CAP    = int(os.getenv("MAX_LEV_CAP", "75"))
-SAFETY_PCT     = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
+TP1_POS_PCT     = float(os.getenv("TP1_POS_PCT", "20"))     # 20/80 Split
+TP2_POS_PCT     = float(os.getenv("TP2_POS_PCT", "80"))
+MAX_LEV_CAP     = int(os.getenv("MAX_LEV_CAP", "75"))
+SAFETY_PCT      = float(os.getenv("SAFETY_PCT", "80"))      # Hebel ~ floor(SAFETY_PCT / SL%)
 
 # Guards
-COOLDOWN_MIN   = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min.)
-ENTRY_EXP_MIN  = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
-DD_LIMIT_PCT   = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
+COOLDOWN_MIN    = int(os.getenv("COOLDOWN_MIN", "45"))      # globaler Cooldown (Min., ab Fill)
+ENTRY_EXP_MIN   = int(os.getenv("ENTRY_EXP_MIN", "60"))     # Entry-Expiry (Min.)
+DD_LIMIT_PCT    = float(os.getenv("DD_LIMIT_PCT", "2.8"))   # Daily-Drawdown-Stop (%)
+
+# Positions-Limits (nur wirklich gefüllte Positionen werden gezählt)
+MAX_OPEN_LONGS  = int(os.getenv("MAX_OPEN_LONGS", "999"))
+MAX_OPEN_SHORTS = int(os.getenv("MAX_OPEN_SHORTS", "999"))
 
 # Eingangs-Payload: wo liegt der Text? (bei rohem Discord-JSON meist "content")
-TEXT_PATH      = os.getenv("TEXT_PATH", "content")
-DEFAULT_NOTION = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
+TEXT_PATH       = os.getenv("TEXT_PATH", "content")
+DEFAULT_NOTION  = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # USDT Margin pro Trade (ohne Hebel)
 
 # ========= App / State =========
 app = FastAPI()
@@ -111,14 +115,14 @@ async def bybit(path: str, method: str, params: Dict[str, Any]) -> Dict[str, Any
         url = f"{BYBIT_BASE}{path}"
         r = await _httpx_client.post(url, headers=headers, content=body.encode("utf-8"))
 
-    # Toleranz: 110043 (leverage not modified) als Erfolg behandeln
+    # 110043 (leverage not modified) als Erfolg tolerieren
     try:
         data = r.json()
     except Exception:
         raise HTTPException(502, f"Bybit non-JSON response ({r.status_code}): {r.text[:200]}")
 
     if data.get("retCode") == 110043:
-        return {}  # treat as ok
+        return {}
 
     if r.status_code != 200 or data.get("retCode") != 0:
         raise HTTPException(502, f"Bybit error {data.get('retCode')}: {data.get('retMsg')}, {data}")
@@ -141,6 +145,32 @@ async def positions(symbol: Optional[str] = None):
     if symbol: params["symbol"] = symbol
     res = await bybit("/v5/position/list", "GET", params)
     return res.get("list", [])
+
+async def positions_size_symbol(symbol: str) -> float:
+    pos = await positions(symbol)
+    if not pos: return 0.0
+    try:
+        return float(pos[0].get("size") or 0)
+    except Exception:
+        return 0.0
+
+async def count_open_filled() -> Dict[str, int]:
+    """Zähle gefüllte Positionen (size>0) getrennt nach long/short."""
+    res = await positions()
+    longs = shorts = 0
+    for p in res:
+        try:
+            sz = float(p.get("size") or 0)
+            if sz <= 0: 
+                continue
+            side = (p.get("side") or "").lower()  # "Buy"/"Sell"
+            if side == "buy":
+                longs += 1
+            elif side == "sell":
+                shorts += 1
+        except Exception:
+            pass
+    return {"longs": longs, "shorts": shorts}
 
 async def close_all_positions():
     pos = await positions()
@@ -221,7 +251,7 @@ async def set_leverage(symbol: str, lev: int):
     })
 
 async def place_entry_only(symbol: str, side: str, entry: float, notional_usdt: float):
-    """Nur Entry-Limit platzieren. TP/SL werden NACH Fill erzeugt."""
+    """Nur Entry-Limit platzieren. TP/SL werden NACH (Teil-)Fill erzeugt."""
     qty = max(0.001, round(notional_usdt/entry, 6))
     BY = "Buy" if side=="long" else "Sell"
     uid = hex(int(time.time()*1000))[2:]
@@ -235,7 +265,7 @@ async def place_entry_only(symbol: str, side: str, entry: float, notional_usdt: 
     return link_entry, qty
 
 async def place_tp_sl_after_fill(symbol: str, side: str, size: float, tp1: float, tp2: float, sl: float):
-    """Nach Entry-Fill: TP1/TP2 reduceOnly + StopLoss anlegen."""
+    """Nach Entry-(Teil)Fill: TP1/TP2 reduceOnly + StopLoss anlegen."""
     OP = "Sell" if side=="long" else "Buy"
     uid = hex(int(time.time()*1000))[2:]
     link_tp1 = f"tp1_{symbol}_{uid}"
@@ -258,11 +288,12 @@ async def place_tp_sl_after_fill(symbol: str, side: str, size: float, tp1: float
     })
 
     # StopLoss (Stop-Market)
-    trigDir = 2 if OP=="Sell" else 1  # falls benötigt, wird hier aber nicht strikt geprüft
+    trigDir = 2 if OP=="Sell" else 1
     await bybit("/v5/order/create","POST",{
         "category":"linear","symbol":symbol,"side":OP,
         "orderType":"Market","reduceOnly":"true",
         "triggerPrice":str(sl),"triggerDirection":trigDir,
+        "triggerBy":"LastPrice",
         "stopOrderType":"StopLoss","timeInForce":"GTC",
         "orderLinkId":link_sl
     })
@@ -275,14 +306,6 @@ async def order_status_by_link(symbol: str, link_id: str) -> Optional[str]:
     lst = res.get("list",[])
     if not lst: return None
     return lst[0].get("orderStatus")  # New / PartiallyFilled / Filled / Cancelled / Rejected
-
-async def positions_size_symbol(symbol: str) -> float:
-    pos = await positions(symbol)
-    if not pos: return 0.0
-    try:
-        return float(pos[0].get("size") or 0)
-    except Exception:
-        return 0.0
 
 async def set_stop_to_BE(symbol: str, side: str):
     pos = await positions(symbol)
@@ -322,6 +345,7 @@ async def monitor_loop():
         for symbol, meta in list(STATE["open_watch"].items()):
             # Entry-Expiry, solange Entry nicht filled
             if not meta.get("filled"):
+                # Ablaufzeit?
                 if now_ts() - meta["created_ts"] > meta.get("expiry_min", 60)*60:
                     st = await order_status_by_link(symbol, meta["entry_id"])
                     if st in ("New","PartiallyFilled"):
@@ -329,17 +353,9 @@ async def monitor_loop():
                         to_del.append(symbol)
                         continue
 
-                # Check ob Entry filled
-                st_entry = await order_status_by_link(symbol, meta["entry_id"])
-                if st_entry == "Filled":
-                    # Positiongröße holen
-                    size = await positions_size_symbol(symbol)
-                    if size <= 0:
-                        # kurz warten & nochmal versuchen
-                        await asyncio.sleep(2)
-                        size = await positions_size_symbol(symbol)
-
-                    # TP/SL jetzt anlegen
+                # Exits anlegen, sobald size>0 (egal ob Filled/PartiallyFilled)
+                size = await positions_size_symbol(symbol)
+                if size > 0:
                     tp1_id, tp2_id, sl_id = await place_tp_sl_after_fill(
                         symbol=symbol,
                         side=meta["side"],
@@ -382,7 +398,7 @@ async def monitor_loop():
 # Hintergrund starten
 asyncio.get_event_loop().create_task(monitor_loop())
 
-# ========= Guards =========
+# ========= Guards & DD =========
 def in_cooldown() -> bool:
     return (now_ts() - STATE.get("last_trade_ts", 0.0)) < COOLDOWN_MIN*60
 
@@ -445,27 +461,37 @@ async def webhook(request: Request):
     if not sigs:
         raise HTTPException(422, f"No valid signal for TFs {sorted(ALLOWED_TFS)} found")
 
-    # Cooldown nur blocken, wenn bereits letzter FILL jung ist
+    # **Positions-Limits prüfen (nur gefüllte zählen)**
+    counts = await count_open_filled()
+    side_preview = "long" if sigs[0]["side"] == "long" else "short"
+    if side_preview == "long" and counts["longs"] >= MAX_OPEN_LONGS:
+        raise HTTPException(429, f"Max open longs reached ({counts['longs']}/{MAX_OPEN_LONGS})")
+    if side_preview == "short" and counts["shorts"] >= MAX_OPEN_SHORTS:
+        raise HTTPException(429, f"Max open shorts reached ({counts['shorts']}/{MAX_OPEN_SHORTS})")
+
+    # Cooldown nur blocken, wenn letzter Fill jung ist
     if in_cooldown():
         raise HTTPException(429, f"In cooldown ({COOLDOWN_MIN} min since last fill)")
 
+    # Nur das erste valide Setup umsetzen
     sig = sigs[0]
     base, quote, side = sig["base"], sig["quote"], sig["side"]
     entry, tp1, tp2, sl = sig["entry"], sig["tp1"], sig["tp2"], sig["sl"]
-    symbol = f"{base}{quote}"  # Bybit Perp: e.g. SOLUSDT
+    symbol = f"{base}{quote}"  # Bybit Perp: z.B. SOLUSDT
 
-    # Hebel
+    # Hebel setzen
     lev = leverage_from_sl(entry, sl, side)
     await set_leverage(symbol, lev)
 
+    # DD-Check
     paused = await check_daily_dd_and_pause(0.0)
     if paused:
         raise HTTPException(423, "Trading paused by daily drawdown")
 
-    # Nur Entry platzieren; TP/SL nach Fill
+    # Nur Entry platzieren; TP/SL nach (Teil-)Fill
     entry_id, qty = await place_entry_only(symbol, side, entry, notional_usdt=notional)
 
-    # Watch-Objekt anlegen
+    # Watch-Objekt für diesen Symbol-Trade
     STATE["open_watch"][symbol] = {
         "entry_id": entry_id, "side": side,
         "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2, "sl_px": sl,
@@ -479,7 +505,8 @@ async def webhook(request: Request):
         "entry": entry, "tp1": tp1, "tp2": tp2, "sl": sl,
         "leverage": lev,
         "entry_order_id": entry_id,
-        "note": "TP/SL werden nach Entry-Fill automatisch angelegt."
+        "positions_open_counts": counts,
+        "note": "TP/SL werden nach (Teil-)Fill automatisch angelegt."
     }
 
 @app.get("/health")
