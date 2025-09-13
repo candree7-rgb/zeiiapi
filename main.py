@@ -26,14 +26,14 @@ MAX_OPEN_LONGS   = int(os.getenv("MAX_OPEN_LONGS", "999"))
 MAX_OPEN_SHORTS  = int(os.getenv("MAX_OPEN_SHORTS", "999"))
 
 TEXT_PATH        = os.getenv("TEXT_PATH", "content")
-DEFAULT_NOTION   = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # Margin pro Trade (ohne Hebel)
+DEFAULT_NOTIONAL = float(os.getenv("DEFAULT_NOTIONAL", "50"))  # Margin pro Trade (ohne Hebel)
 
 # ========= App / State =========
 app = FastAPI()
 _httpx_client: Optional[httpx.AsyncClient] = None
 
 STATE: Dict[str, Any] = {
-    "last_trade_ts": 0.0,
+    "last_trade_ts": 0.0,             # wird erst bei (Teil-)Fill gesetzt
     "trading_paused_until": None,
     "day_start_equity": None,
     "day_realized_pnl": 0.0,
@@ -122,7 +122,7 @@ def _quantize(v: float, step: float, mode: str = "floor") -> float:
 
 async def get_symbol_meta(symbol: str) -> Dict[str, float]:
     """
-    Fetch and cache tickSize (price), stepSize (qty), minOrderQty for linear perps.
+    Fetch & cache tickSize (price), stepSize (qty), minOrderQty for linear perps.
     """
     if symbol in SYMBOL_META:
         return SYMBOL_META[symbol]
@@ -140,7 +140,6 @@ async def get_symbol_meta(symbol: str) -> Dict[str, float]:
         "tickSize": float(pf.get("tickSize", "0.01")),
         "stepSize": float(lf.get("qtyStep", lf.get("stepSize", "0.001"))),
         "minQty":   float(lf.get("minOrderQty", "0.001")),
-        # optional notional filter if present (rare on perps):
         "minNotional": float(lf.get("minOrderAmt", "0")) if lf.get("minOrderAmt") else 0.0
     }
     SYMBOL_META[symbol] = meta
@@ -210,7 +209,7 @@ def parse_signals(text: str):
         base, quote = m_pair.group(1).upper(), m_pair.group(2).upper()
         if quote=="USD": quote="USDT"
         entry,tp1,tp2,sl = map(float,[m_entry.group(1),m_tp1.group(1),m_tp2.group(1),m_sl.group(1)])
-        # grobe Plausibilität
+        # Plausibilität
         if side=="long"  and not (sl < entry < tp1 <= tp2): continue
         if side=="short" and not (sl > entry > tp1 >= tp2): continue
         signals.append({"base":base,"quote":quote,"side":side,"entry":entry,"tp1":tp1,"tp2":tp2,"sl":sl,"tf":tf})
@@ -231,14 +230,14 @@ async def set_leverage(symbol: str, lev: int):
     })
 
 async def place_entry(symbol: str, side: str, entry: float, notional_usdt: float, leverage: int) -> Tuple[str, float]:
-    # Fetch filters
+    # Filters
     meta = await get_symbol_meta(symbol)
     tick = meta["tickSize"]; step = meta["stepSize"]; minQty = meta["minQty"]
 
     entry_q = quant_price(entry, tick)
 
-    # Qty based on (margin * leverage) / price
-    raw_qty = (notional_usdt * leverage) / entry_q
+    # Qty = (margin * leverage) / price
+    raw_qty = (notional_usdt * leverage) / max(entry_q, 1e-9)
     qty = quant_qty(max(raw_qty, minQty), step)
     if qty < minQty:
         raise HTTPException(400, f"Qty too small after rounding for {symbol}. Increase notional or leverage.")
@@ -263,6 +262,11 @@ async def place_entry(symbol: str, side: str, entry: float, notional_usdt: float
     return link_entry, qty
 
 async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: float, sl: float):
+    """
+    Legt TP1/TP2 als reduceOnly-Limits an und den StopLoss als positionsweiten SL
+    (set-trading-stop). Dadurch kein qty/minQty-Ärger beim SL und sichtbar im
+    Positions-Panel.
+    """
     meta = await get_symbol_meta(symbol)
     tick = meta["tickSize"]; step = meta["stepSize"]; minQty = meta["minQty"]
 
@@ -277,19 +281,11 @@ async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: floa
     q1 = quant_qty(max(q1_raw, 0.0), step)
     q2 = quant_qty(max(q2_raw, 0.0), step)
 
-    # Ensure both TP legs meet minQty, adjust if needed
-    if q1 < minQty and q2 >= (minQty*2):
-        q1 = minQty
-        q2 = quant_qty(max(size - q1, 0.0), step)
-    if q2 < minQty and q1 >= (minQty*2):
-        q2 = minQty
-        q1 = quant_qty(max(size - q2, 0.0), step)
-
-    # Final sanity: total cannot exceed size
+    # Sicherstellen, dass wir nicht über size hinausgehen
     if q1 + q2 > size:
         q2 = quant_qty(max(size - q1, 0.0), step)
 
-    # If still too small overall, collapse to a single TP
+    # Falls beide < minQty -> alles in TP1
     just_tp1 = False
     if q1 < minQty and q2 < minQty:
         q1 = quant_qty(size, step)
@@ -300,7 +296,6 @@ async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: floa
     uid = hex(int(now_ts()*1000))[2:]
     link_tp1 = f"tp1_{symbol}_{uid}"
     link_tp2 = f"tp2_{symbol}_{uid}"
-    link_sl  = f"sl_{symbol}_{uid}"
 
     # TP1
     if q1 >= minQty:
@@ -312,7 +307,7 @@ async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: floa
         })
         print(f"✅ TP1 {symbol} {OP} {q1} @ {tp1_q}")
 
-    # TP2 (if any)
+    # TP2 (optional)
     if not just_tp1 and q2 >= minQty:
         await bybit("/v5/order/create","POST",{
             "category":"linear","symbol":symbol,"side":OP,
@@ -325,20 +320,32 @@ async def place_tp_sl(symbol: str, side: str, size: float, tp1: float, tp2: floa
         link_tp2 = None
         print(f"ℹ️ TP2 skipped (q2<{minQty})")
 
-    # SL – conditional market (full remaining size)
-    # Use current size for safety; Bybit enforces step too
-    size_q = quant_qty(size, step)
-    trigDir = 2 if side=="long" else 1
-    await bybit("/v5/order/create","POST",{
-        "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Market","qty":str(size_q),
-        "triggerPrice":str(sl_q),"triggerDirection":trigDir,"triggerBy":"LastPrice",
-        "timeInForce":"IOC","reduceOnly":True,"closeOnTrigger":True,
-        "orderLinkId":link_sl
+    # StopLoss (positionsweit)
+    await bybit("/v5/position/set-trading-stop","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "tpSlMode":"Full",
+        "stopLoss": str(sl_q)
     })
-    print(f"✅ SL {symbol} {OP} {size_q} trigger @ {sl_q}")
+    print(f"✅ SL set (position-wide) {symbol} @ {sl_q}")
 
-    return link_tp1, link_tp2, link_sl
+    return link_tp1, link_tp2, "pos_stop"
+
+async def move_sl_to_be(symbol: str, side: str, entry_price: float):
+    meta = await get_symbol_meta(symbol)
+    be_q  = quant_price(entry_price, meta["tickSize"])
+    # winziger Offset, damit sofort greift
+    off   = max(be_q * 0.0002, meta["tickSize"])
+    be_px = be_q - off if side=="long" else be_q + off
+
+    await bybit("/v5/position/set-trading-stop","POST",{
+        "category":"linear",
+        "symbol":symbol,
+        "tpSlMode":"Full",
+        "stopLoss": str(quant_price(be_px, meta["tickSize"]))
+    })
+    print(f"✅ SL moved to BE {symbol} @ {be_px}")
+    return "pos_stop_be"
 
 async def cancel_order(symbol: str, order_link_id: str):
     try:
@@ -348,25 +355,6 @@ async def cancel_order(symbol: str, order_link_id: str):
         print(f"✅ Cancelled order: {order_link_id}")
     except Exception as e:
         print(f"⚠️ Cancel failed {order_link_id}: {e}")
-
-async def move_sl_to_be(symbol: str, side: str, entry_price: float, remaining_size: float):
-    meta = await get_symbol_meta(symbol)
-    tick = meta["tickSize"]; step = meta["stepSize"]
-    entry_q = quant_price(entry_price, tick)
-    size_q  = quant_qty(remaining_size, step)
-    OP = "Sell" if side=="long" else "Buy"
-    trigDir = 2 if side=="long" else 1
-    uid = hex(int(now_ts()*1000))[2:]
-    link_sl_be = f"sl_be_{symbol}_{uid}"
-    await bybit("/v5/order/create","POST",{
-        "category":"linear","symbol":symbol,"side":OP,
-        "orderType":"Market","qty":str(size_q),
-        "triggerPrice":str(entry_q),"triggerDirection":trigDir,"triggerBy":"LastPrice",
-        "timeInForce":"IOC","reduceOnly":True,"closeOnTrigger":True,
-        "orderLinkId":link_sl_be
-    })
-    print(f"✅ SL→BE {symbol} qty {size_q} @ {entry_q}")
-    return link_sl_be
 
 # ========= Monitor Loop =========
 async def monitor_loop():
@@ -393,7 +381,7 @@ async def monitor_loop():
                         )
                         meta.update({
                             "tp1_id": tp1_id, "tp2_id": tp2_id, "sl_id": sl_id,
-                            "exits_set": True, "tp1_hit": False, "sl_moved_to_be": False
+                            "exits_set": True, "tp1_hit": False, "sl_be": False
                         })
                         STATE["last_trade_ts"] = now_ts()  # Cooldown erst jetzt
                         continue
@@ -403,12 +391,9 @@ async def monitor_loop():
                     st_tp1 = await get_order_status(symbol, meta["tp1_id"])
                     if st_tp1 == "Filled":
                         meta["tp1_hit"] = True
-                        rem = await positions_size_symbol(symbol)
-                        if rem > 0 and not meta.get("sl_moved_to_be") and meta.get("sl_id"):
-                            await cancel_order(symbol, meta["sl_id"])
-                            new_sl = await move_sl_to_be(symbol, meta["side"], meta["entry_px"], rem)
-                            meta["sl_id"] = new_sl
-                            meta["sl_moved_to_be"] = True
+                        if not meta.get("sl_be"):
+                            await move_sl_to_be(symbol, meta["side"], meta["entry_px"])
+                            meta["sl_be"] = True
 
                 # Phase 3: Cleanup wenn Pos zu
                 cur = await positions_size_symbol(symbol)
@@ -469,7 +454,7 @@ async def webhook(request: Request):
     await set_leverage(symbol, lev)
 
     # Entry platzieren (quantized, inkl. minQty)
-    notional = float(body.get("notional") or DEFAULT_NOTION)
+    notional = float(body.get("notional") or DEFAULT_NOTIONAL)
     entry_id, qty = await place_entry(symbol, side, entry, notional, lev)
 
     # Watch für Exit-Management
@@ -477,7 +462,7 @@ async def webhook(request: Request):
         "entry_id": entry_id, "side": side,
         "entry_px": entry, "tp1_px": tp1, "tp2_px": tp2, "sl_px": sl,
         "created_ts": now_ts(), "expiry_min": ENTRY_EXP_MIN,
-        "exits_set": False, "tp1_hit": False, "sl_moved_to_be": False
+        "exits_set": False, "tp1_hit": False, "sl_be": False
     }
 
     return {
